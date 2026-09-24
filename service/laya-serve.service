@@ -1,0 +1,17 @@
+[Unit]
+Description=Laya decision server (intent classifier for pi-laya-router)
+After=network-online.target
+
+[Service]
+ExecStart=%h/.local/bin/laya-serve
+Environment=LAYA_HOST=127.0.0.1
+Environment=LAYA_PORT=8811
+Environment=LAYA_DEVICE=cuda
+Environment=LAYA_MODELS=english
+Environment=LAYA_PRELOAD=1
+Environment=LAYA_LOG_LEVEL=warning
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

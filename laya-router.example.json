@@ -1,0 +1,42 @@
+{
+  "headroom": { "provider": "headroom", "baseUrl": "http://localhost:8787/v1" },
+  "laya": { "url": "http://127.0.0.1:8811", "model": "english", "timeoutMs": 3000 },
+  "fallback": { "enabled": true, "model": "google/gemini-3.5-flash-lite", "timeoutMs": 8000, "assumedConfidence": 0.8 },
+  "thresholds": {
+    "adopt": 0.55,
+    "switch": 0.7,
+    "fast": 0.9,
+    "margin": 0.15,
+    "streak": 2,
+    "cooldownTurns": 3,
+    "compactMinTokens": 24000
+  },
+  "autoModel": { "contextWindow": 200000, "maxTokens": 32768 },
+  "defaultIntent": "coding",
+  "logPath": "~/.pi/agent/laya-router/decisions.jsonl",
+  "intents": {
+    "coding": {
+      "model": "google/gemini-3.7-flash",
+      "skill": "coder",
+      "hint": "Act as an implementer: make focused, correct code changes, read before editing, and verify with tests or a dry run.",
+      "criteria": "write, edit, fix or refactor code; implement a change; make tests pass; run commands to get code working"
+    },
+    "planning": {
+      "model": "minimax/minimax-m3",
+      "skill": "planner",
+      "hint": "Act as a planner: understand the problem deeply, explore the codebase, weigh trade-offs, and produce a numbered plan before touching code.",
+      "criteria": "design, architecture, trade-offs, step-by-step plans, research or investigation before building, deciding an approach"
+    },
+    "ui_ux": {
+      "model": "google/gemini-3.7-flash",
+      "skill": "designer",
+      "hint": "Act as a UI/UX implementer: care about layout, spacing, states, accessibility and copy; check the result visually when possible.",
+      "criteria": "layout, styling, visual design, components, colors, copy, accessibility, front-end look and feel"
+    },
+    "chat": {
+      "model": "google/gemini-3.5-flash-lite",
+      "hint": "Answer directly and briefly; no tools unless needed.",
+      "criteria": "questions, explanations, small utility tasks, casual conversation"
+    }
+  }
+}
