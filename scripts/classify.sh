@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Smoke test the Laya server with the same intents the extension uses.
+# Smoke test the Laya server with the roles from your main config file (drop-ins
+# and project layers are not merged here; use /router roles inside Pi for that).
 #   scripts/classify.sh "add a retry loop to the fetch helper"
 set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -17,7 +18,8 @@ body = {
     "state": {"request": text, "previous": ""},
     "questions": {"intent": {"type": "choice",
         "instructions": "What kind of work is the user asking the coding agent to do right now?",
-        "criteria": {k: v["criteria"] for k, v in cfg["intents"].items()}}}}
+        "criteria": {k: v.get("description", v.get("criteria")) for k, v in (cfg.get("roles") or cfg.get("intents", {})).items()
+                     if isinstance(v, dict) and v.get("enabled", True)}}}}
 req = urllib.request.Request(f"{url}/v1/systemone", data=json.dumps(body).encode(), headers={"content-type": "application/json"})
 with urllib.request.urlopen(req, timeout=30) as r:
     a = json.load(r)["answers"]["intent"]

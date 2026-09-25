@@ -5,6 +5,7 @@ import { uuidv7 } from "@earendil-works/pi-ai";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { RouterConfig } from "./config.ts";
 import type { Classification } from "./policy.ts";
+import { enabledRoles, parseLabel } from "./roles.ts";
 
 export interface ClassifyResult extends Classification {
 	probs: Record<string, number>;
@@ -31,7 +32,7 @@ function topTwo(probs: Record<string, number>): { top: string; confidence: numbe
 
 export async function classifyWithLaya(cfg: RouterConfig, text: string, recent: string[]): Promise<ClassifyResult> {
 	const started = Date.now();
-	const criteria = Object.fromEntries(Object.entries(cfg.intents).map(([k, v]) => [k, v.criteria]));
+	const criteria = Object.fromEntries(Object.entries(enabledRoles(cfg.roles)).map(([k, v]) => [k, v.description]));
 	const body = {
 		model: cfg.laya.model,
 		state: {
@@ -71,11 +72,12 @@ export async function classifyWithLlm(
 	recent: string[],
 ): Promise<ClassifyResult> {
 	const started = Date.now();
-	const model = ctx.modelRegistry.find(cfg.headroom.provider, cfg.fallback.model);
-	if (!model) throw new Error(`fallback model ${cfg.headroom.provider}/${cfg.fallback.model} not found`);
+	const model = ctx.modelRegistry.find(cfg.provider.name, cfg.fallback.model);
+	if (!model) throw new Error(`fallback model ${cfg.provider.name}/${cfg.fallback.model} not found`);
 
-	const labels = Object.entries(cfg.intents)
-		.map(([k, v]) => `- ${k}: ${v.criteria}`)
+	const roles = enabledRoles(cfg.roles);
+	const labels = Object.entries(roles)
+		.map(([k, v]) => `- ${k}: ${v.description}`)
 		.join("\n");
 	const prompt = `Classify the user's latest request to a coding agent into exactly one label.
 
@@ -101,9 +103,9 @@ Reply with only the label name.`;
 		.map((c) => c.text)
 		.join(" ")
 		.toLowerCase();
-	const label = Object.keys(cfg.intents).find((k) => out.includes(k.toLowerCase()));
+	const label = parseLabel(out, Object.keys(roles));
 	if (!label) throw new Error(`fallback returned no label: ${out.slice(0, 80)}`);
-	const probs = Object.fromEntries(Object.keys(cfg.intents).map((k) => [k, k === label ? cfg.fallback.assumedConfidence : 0]));
+	const probs = Object.fromEntries(Object.keys(roles).map((k) => [k, k === label ? cfg.fallback.assumedConfidence : 0]));
 	return { top: label, confidence: cfg.fallback.assumedConfidence, margin: 1, probs, source: "llm", ms: Date.now() - started };
 }
 

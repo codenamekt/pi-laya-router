@@ -1,0 +1,95 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://raw.githubusercontent.com/codenamekt/pi-laya-router/main/laya-router.schema.json",
+  "title": "pi-laya-router configuration",
+  "description": "Routing rules for the Laya intent router. Every file in the layer chain (user file, drop-ins, project file) uses this shape; all fields are optional and merge onto the layers below.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "provider": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "description": "Pi provider name that owns the target models (the OpenAI-compatible proxy)." },
+        "name": { "type": "string", "description": "Pi provider name that owns the target models (the OpenAI-compatible proxy)." },
+        "baseUrl": { "type": "string", "description": "Proxy base URL, e.g. http://localhost:8787/v1. Read at startup only." }
+      }
+    },
+    "headroom": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "provider": { "type": "string", "description": "Pi provider name that owns the target models (the OpenAI-compatible proxy)." },
+        "baseUrl": { "type": "string", "description": "Proxy base URL, e.g. http://localhost:8787/v1. Read at startup only." }
+      }
+    },
+    "laya": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "url": { "type": "string" },
+        "model": { "type": "string", "description": "Laya checkpoint name, e.g. english or a fine-tuned one." },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "apiKey": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "fallback": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "model": { "type": "string", "description": "Cheap non-reasoning model used when Laya is unsure or down." },
+        "timeoutMs": { "type": "integer", "minimum": 1 },
+        "assumedConfidence": { "type": "number", "minimum": 0, "maximum": 1 }
+      }
+    },
+    "thresholds": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "adopt": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum confidence to adopt a role on the first turn." },
+        "switch": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum confidence for a turn to count as evidence for a switch." },
+        "fast": { "type": "number", "minimum": 0, "maximum": 1, "description": "Confidence at which a single turn is enough to switch." },
+        "margin": { "type": "number", "minimum": 0, "maximum": 1, "description": "Minimum gap between the top two roles for a turn to count." },
+        "streak": { "type": "integer", "minimum": 1, "description": "Consecutive qualifying turns needed before switching." },
+        "cooldownTurns": { "type": "integer", "minimum": 0, "description": "Minimum user turns between two switches." },
+        "compactMinTokens": { "type": "integer", "minimum": 0, "description": "Compact on switch only above this context size. Must exceed Pi's compaction.keepRecentTokens." }
+      }
+    },
+    "autoModel": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "contextWindow": { "type": "integer", "minimum": 1 },
+        "maxTokens": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "retryAfterMs": { "type": "integer", "minimum": 0 },
+        "failover": { "type": "boolean" }
+      }
+    },
+    "defaultRole": { "type": "string" },
+    "logPath": { "type": "string" },
+    "roles": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "hint": { "type": "string" },
+          "models": { "type": "array", "items": { "type": "string" } },
+          "skills": { "type": "array", "items": { "type": "string" } },
+          "enabled": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

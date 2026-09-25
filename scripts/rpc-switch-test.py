@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive Pi over RPC through an intent switch and confirm compaction + re-send.
+"""Drive Pi over RPC through a role switch and confirm compaction + re-send.
 
 Uses a loosened copy of the example config (switch on the first differing
 turn, compact at any context size) so the second prompt must trigger
@@ -21,6 +21,11 @@ TIMEOUT = 150
 
 tmp = Path(tempfile.mkdtemp(prefix="laya-router-rpc-"))
 cfg = json.loads((REPO / "laya-router.example.json").read_text())
+# The example points at localhost; take the real proxy and Laya settings from the user's config when there is one.
+user_cfg = Path(os.environ.get("LAYA_ROUTER_CONFIG", Path.home() / ".pi" / "agent" / "laya-router.json")).expanduser()
+if user_cfg.exists():
+    for key in ("headroom", "laya", "fallback"):
+        cfg[key] = {**cfg[key], **json.loads(user_cfg.read_text()).get(key, {})}
 cfg["thresholds"].update({"streak": 1, "cooldownTurns": 2, "compactMinTokens": 0, "switch": 0.5, "margin": 0.1})
 cfg["logPath"] = str(tmp / "decisions.jsonl")
 (tmp / "config.json").write_text(json.dumps(cfg))
@@ -29,8 +34,21 @@ cfg["logPath"] = str(tmp / "decisions.jsonl")
 (tmp / ".pi" / "settings.json").write_text(json.dumps({"compaction": {"keepRecentTokens": 800}}))
 
 env = {**os.environ, "LAYA_ROUTER_CONFIG": str(tmp / "config.json")}
+
+# Load the user's other extensions (the proxy provider lives there) but never a
+# second copy of this one, which settings.json may already list.
+settings_file = Path.home() / ".pi" / "agent" / "settings.json"
+user_exts = []
+if settings_file.exists():
+    for ext in json.loads(settings_file.read_text()).get("extensions", []):
+        path = Path(ext).expanduser()
+        if not path.is_absolute():
+            path = settings_file.parent / path
+        if not path.resolve().is_relative_to(REPO):
+            user_exts += ["-e", str(path)]
+
 proc = subprocess.Popen(
-    ["pi", "--mode", "rpc", "--no-session", "--approve", "-e", str(REPO / "extension"), "--model", "laya/auto"],
+    ["pi", "--mode", "rpc", "--no-session", "--approve", "--no-extensions", *user_exts, "-e", str(REPO / "extension"), "--model", "laya/auto"],
     cwd=tmp, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
 )
 events: list[dict] = []
@@ -66,6 +84,20 @@ def wait_for(pred, timeout=TIMEOUT):
     return False
 
 
+def wait_for_turn(prompt_id: str, start: int, timeout=TIMEOUT) -> bool:
+    """A turn is done when its prompt was accepted and a run has ended and settled after that.
+    Pi also emits agent_settled at startup, so counting settles alone is racy."""
+    def done(_):
+        seq = [(e.get("type"), e.get("id")) for e in events[start:]]
+        try:
+            resp = next(i for i, (t, i_) in enumerate(seq) if t == "response" and i_ == prompt_id)
+            end = next(i for i, (t, _) in enumerate(seq) if t == "agent_end" and i > resp)
+            return any(t == "agent_settled" and i > end for i, (t, _) in enumerate(seq))
+        except StopIteration:
+            return False
+    return wait_for(done, timeout)
+
+
 def kinds(start: int):
     return [e.get("type") for e in events[start:] if e.get("type") not in ("message_update",)]
 
@@ -83,18 +115,15 @@ try:
     # (the cut point needs more than one assistant message before it).
     for i, topic in enumerate(["HTTP caching", "TCP congestion control"], start=1):
         mark = len(events)
-        settled_before = sum(1 for e in events if e.get("type") == "agent_settled")
         send({"id": f"p{i}", "type": "prompt", "message": f"No tools. Write about 500 words explaining {topic}, then end with the word OK."})
-        assert wait_for(lambda e: sum(1 for x in events if x.get("type") == "agent_settled") > settled_before), f"turn {i} never settled"
+        assert wait_for_turn(f"p{i}", mark), f"turn {i} never settled"
         print(f"turn {i}:", kinds(mark)[-3:], "-> chars:", len(assistant_text(mark)))
 
     # Turn 3: planning -> should switch, compact, re-send, answer.
     mark = len(events)
-    settled_before = sum(1 for e in events if e.get("type") == "agent_settled")
     send({"id": "p3", "type": "prompt",
           "message": "Do not use tools. Plan how you would migrate this project's auth to Keycloak: give exactly 3 numbered steps, one line each."})
-    assert wait_for(lambda e: e.get("type") == "agent_settled" and
-                    sum(1 for x in events if x.get("type") == "agent_settled") > settled_before), "turn 3 never settled"
+    assert wait_for_turn("p3", mark), "turn 3 never settled"
     ks = kinds(mark)
     print("turn 3:", ks)
     print("turn 3 answer:", repr(assistant_text(mark)[:200]))

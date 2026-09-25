@@ -2,11 +2,12 @@
  * Laya intent router for Pi.
  *
  * Registers a `laya` provider with one model, `auto`. While `laya/auto`
- * is selected, every user turn is classified (Laya locally, cheap LLM as
- * fallback), a hysteresis policy decides whether the kind of work changed,
- * and the outgoing request's `model` is rewritten to the intent's target.
- * On a switch the session is compacted with instructions about the move,
- * and the model gets a short hint naming the suggested skill.
+ * is selected, every user turn is classified into one of the configured
+ * roles (Laya locally, cheap LLM as fallback), a hysteresis policy decides
+ * whether the kind of work changed, and the outgoing request's `model` is
+ * rewritten to the first healthy model in the role's chain. On a switch the
+ * session is compacted with instructions about the move, and the model gets
+ * the role's hint plus the skills that go with it.
  *
  * Usage: pi -e /path/to/pi-laya-router/extension   then   /model laya/auto
  */
@@ -14,9 +15,10 @@ import { uuidv7 } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { convertToLlm, serializeConversation } from "@earendil-works/pi-coding-agent";
 import { classify, type ClassifyResult } from "./classifier.ts";
-import { configPath, headroomApiKey, loadConfig, type RouterConfig } from "./config.ts";
+import { configLayers, loadConfig, providerApiKey, type RouterConfig } from "./config.ts";
 import { logDecision } from "./log.ts";
 import { type Decision, decide, freshState, type RouterState } from "./policy.ts";
+import { enabledRoles, formatIssue, pickModel, type Role } from "./roles.ts";
 import { persist, recentUserTurns, restore } from "./state.ts";
 
 const PROVIDER = "laya";
@@ -24,12 +26,37 @@ const MODEL_ID = "auto";
 const RECENT_TURNS = 2;
 const COMPACT_SLOW_MS = 60_000;
 
+function checkExplicitSwitch(text: string, roles: Record<string, Role>): string | undefined {
+	const lower = text.toLowerCase();
+	for (const [id, role] of Object.entries(roles)) {
+		if (!role.enabled) continue;
+		const name = role.name.toLowerCase();
+		const patterns = [
+			`switch to ${id}`, `switch to ${name}`,
+			`use ${id}`, `use ${name}`,
+			`change to ${id}`, `change to ${name}`,
+			`go to ${id}`, `go to ${name}`,
+		];
+		if (patterns.some((p) => lower.includes(p))) return id;
+	}
+	return undefined;
+}
+
 export default function (pi: ExtensionAPI) {
-	const cfg: RouterConfig = loadConfig();
+	let cfg: RouterConfig = loadConfig();
 	let state: RouterState = freshState();
 	/** Set when a run should announce an adopt/switch to the model. */
 	let pendingNotice: Decision | null = null;
 	let last: ClassifyResult | null = null;
+	/** Model id → time it last failed. Shared across roles: a model that is down is down. */
+	const failed = new Map<string, number>();
+	/** Model the last upstream request was rewritten to. */
+	let lastSentModel: string | null = null;
+	/** Chain failovers taken during the current user turn. */
+	let failovers = 0;
+	/** Skill names Pi advertised on the last run, for `/router roles` diagnostics. */
+	let knownSkills: string[] = [];
+	let issuesShown = false;
 
 	// ---------------------------------------------------------------- helpers
 
@@ -39,9 +66,19 @@ export default function (pi: ExtensionAPI) {
 	const isRouting = (ctx: ExtensionContext) => state.on && isDelegating(ctx);
 	/** Compact-then-resend is asynchronous; print/json mode awaits a single prompt and would lose it. */
 	const isInteractive = (ctx: ExtensionContext) => ctx.mode === "tui" || ctx.mode === "rpc";
-	const intentOf = (name: string | null) => (name && cfg.intents[name]) || cfg.intents[cfg.defaultIntent];
-	const targetModel = () => intentOf(state.intent).model;
+	/** state.intent holds a role id; a stale or disabled one falls back to the default role. */
+	const roleOf = (id: string | null): Role => (id && cfg.roles[id]?.enabled ? cfg.roles[id] : cfg.roles[cfg.defaultRole]);
+	const currentRole = () => roleOf(state.intent);
+	const targetModel = () => pickModel(currentRole(), failed, Date.now(), cfg.chain.retryAfterMs).model;
 	const shortModel = (id: string) => id.split("/").pop() ?? id;
+	const roleIds = () => Object.keys(enabledRoles(cfg.roles));
+
+	function showIssues(ctx: ExtensionContext) {
+		if (issuesShown || !ctx.hasUI || cfg.issues.length === 0) return;
+		issuesShown = true;
+		const errors = cfg.issues.filter((i) => i.level === "error").length;
+		ctx.ui.notify(`Router config: ${cfg.issues.length} issue(s), ${errors} error(s). See /router config.`, errors ? "warning" : "info");
+	}
 
 	function showStatus(ctx: ExtensionContext) {
 		if (!ctx.hasUI) return;
@@ -49,22 +86,25 @@ export default function (pi: ExtensionAPI) {
 			ctx.ui.setStatus("router", undefined);
 			return;
 		}
-		const intent = state.intent ?? cfg.defaultIntent;
+		const role = currentRole();
 		const pending = state.candidate ? ` (${state.candidate.intent} ${state.candidate.n}/${cfg.thresholds.streak})` : "";
 		const forced = state.forced ? " pinned" : "";
-		ctx.ui.setStatus("router", `⇄ ${intent}${forced} · ${shortModel(targetModel())}${pending}`);
+		const pick = pickModel(role, failed, Date.now(), cfg.chain.retryAfterMs);
+		const chain = pick.index > 0 ? ` #${pick.index + 1}` : "";
+		ctx.ui.setStatus("router", `⇄ ${role.id}${forced} · ${shortModel(pick.model)}${chain}${pending}`);
 	}
 
+	/** Skills the role asks for that Pi actually has (unknown until the first run; then trusted). */
+	const availableSkills = (role: Role) => (knownSkills.length ? role.skills.filter((s) => knownSkills.includes(s)) : role.skills);
+
 	function noticeText(d: Decision): string | null {
-		if (d.kind === "adopt") {
-			const i = intentOf(d.intent);
-			return `Laya router: intent **${d.intent}** → \`${i.model}\`${i.skill ? ` · suggested skill: /skill:${i.skill}` : ""}`;
-		}
-		if (d.kind === "switch") {
-			const i = intentOf(d.to);
-			return `Laya router: **${d.from} → ${d.to}**, now serving with \`${i.model}\`${i.skill ? ` · suggested skill: /skill:${i.skill}` : ""}`;
-		}
-		return null;
+		if (d.kind !== "adopt" && d.kind !== "switch") return null;
+		const role = roleOf(d.kind === "adopt" ? d.intent : d.to);
+		const model = pickModel(role, failed, Date.now(), cfg.chain.retryAfterMs).model;
+		const skills = availableSkills(role);
+		const skillNote = skills.length ? ` · skills: ${skills.map((s) => `/skill:${s}`).join(", ")}` : "";
+		const head = d.kind === "adopt" ? `role **${role.name}**` : `**${d.from} → ${d.to}** (${role.name})`;
+		return `Laya router: ${head} → \`${model}\`${skillNote}`;
 	}
 
 	function compactInstructions(from: string, to: string): string {
@@ -79,10 +119,10 @@ export default function (pi: ExtensionAPI) {
 	 * summary. Pi refuses prompts while compaction is in flight, so the prompt
 	 * is only ever re-sent from the completion callbacks; the timer just warns.
 	 */
-	function compactThenResend(ctx: ExtensionContext, text: string, images: unknown[] | undefined, from: string, to: string) {
+	function compactThenResend(ctx: ExtensionContext, text: string, images: Array<{ type: string; [k: string]: unknown }> | undefined, from: string, to: string) {
 		const resend = () => {
-			const content = images?.length ? [{ type: "text" as const, text }, ...(images as never[])] : text;
-			pi.sendUserMessage(content as never, { expandPromptTemplates: false });
+			const content = images?.length ? [{ type: "text" as const, text }, ...images] : text;
+			pi.sendUserMessage(content as Parameters<typeof pi.sendUserMessage>[0], { expandPromptTemplates: false });
 		};
 		const slow = setTimeout(() => {
 			if (ctx.hasUI) ctx.ui.notify("Router: compaction is taking a while; your prompt is queued behind it", "warning");
@@ -106,8 +146,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.registerProvider(PROVIDER, {
 		name: "Laya",
-		baseUrl: cfg.headroom.baseUrl,
-		apiKey: headroomApiKey(),
+		baseUrl: cfg.provider.baseUrl,
+		apiKey: providerApiKey(),
 		api: "openai-completions",
 		models: [
 			{
@@ -127,7 +167,64 @@ export default function (pi: ExtensionAPI) {
 		if (!isDelegating(ctx)) return;
 		const payload = event.payload as { model?: unknown } | undefined;
 		if (!payload || typeof payload !== "object" || typeof payload.model !== "string") return;
-		return { ...payload, model: targetModel() };
+		lastSentModel = targetModel();
+		return { ...payload, model: lastSentModel };
+	});
+
+	// Model chain failover. A model that errors is marked failed as soon as the
+	// turn ends, so Pi's own auto-retry (429s, 5xx, dropped streams) already
+	// lands on the next model in the chain. Errors Pi does not retry (a 400 for
+	// an unknown model, say) reach agent_before_settle: the failed reply is
+	// omitted from context, like Pi's retry does, and one more run is requested.
+	const markFailed = (model: string) => {
+		failed.set(model, Date.now());
+		// Prune entries older than retryAfterMs to avoid unbounded growth.
+		const now = Date.now();
+		for (const [m, at] of failed) {
+			if (now - at >= cfg.chain.retryAfterMs) failed.delete(m);
+		}
+	};
+
+	pi.on("turn_end", (event, ctx) => {
+		if (!isDelegating(ctx) || !lastSentModel) return;
+		const msg = event.message as { role?: string; stopReason?: string };
+		if (msg.role === "assistant" && msg.stopReason === "error") {
+			markFailed(lastSentModel);
+			if (ctx.hasUI) {
+				const pick = pickModel(currentRole(), failed, Date.now(), cfg.chain.retryAfterMs);
+				if (!pick.healthy) {
+					ctx.ui.notify(`Router: all models in the ${currentRole().id} chain have failed recently; using least-recently-failed ${shortModel(pick.model)}`, "warning");
+				}
+			}
+		}
+	});
+
+	pi.on("agent_before_settle", (event, ctx) => {
+		if (!isDelegating(ctx) || event.outcome !== "error" || !lastSentModel) return;
+		const role = currentRole();
+		if (!role.models.includes(lastSentModel)) return;
+		markFailed(lastSentModel);
+		const next = pickModel(role, failed, Date.now(), cfg.chain.retryAfterMs);
+		const failedEntry = [...event.context.contextEntries].reverse().find((e) => {
+			const src = e.sourceEntry as { type: string; message?: { role?: string; stopReason?: string } };
+			return src.type === "message" && src.message?.role === "assistant" && src.message.stopReason === "error";
+		});
+		const canFailover = cfg.chain.failover && next.healthy && next.model !== lastSentModel && failedEntry !== undefined && failovers < role.models.length - 1;
+		if (ctx.hasUI) {
+			ctx.ui.notify(
+				canFailover
+					? `Router: ${shortModel(lastSentModel)} failed; retrying on ${shortModel(next.model)} (${role.id} chain #${next.index + 1})`
+					: `Router: ${shortModel(lastSentModel)} failed; no other healthy model in the ${role.id} chain`,
+				"warning",
+			);
+		}
+		showStatus(ctx);
+		if (!canFailover) return;
+		failovers++;
+		return {
+			entries: [...event.entries, { type: "context_edit", targetId: (failedEntry.sourceEntry as { id: string }).id, replacement: null }],
+			continue: true,
+		};
 	});
 
 	// Pi's built-in summarizer calls the provider directly, bypassing the payload
@@ -138,10 +235,10 @@ export default function (pi: ExtensionAPI) {
 		const { preparation, customInstructions, signal } = event;
 		const { messagesToSummarize, turnPrefixMessages, tokensBefore, firstKeptEntryId, previousSummary } = preparation;
 		const model =
-			ctx.modelRegistry.find(cfg.headroom.provider, targetModel()) ??
-			ctx.modelRegistry.find(cfg.headroom.provider, cfg.fallback.model);
+			ctx.modelRegistry.find(cfg.provider.name, targetModel()) ??
+			ctx.modelRegistry.find(cfg.provider.name, cfg.fallback.model);
 		if (!model) {
-			if (ctx.hasUI) ctx.ui.notify(`Router: no summarizer model found under ${cfg.headroom.provider}; compaction cancelled`, "warning");
+			if (ctx.hasUI) ctx.ui.notify(`Router: no summarizer model found under ${cfg.provider.name}; compaction cancelled`, "warning");
 			return { cancel: true };
 		}
 		const conversation = serializeConversation(convertToLlm([...messagesToSummarize, ...turnPrefixMessages]));
@@ -179,7 +276,10 @@ ${conversation}
 		state = restore(ctx);
 		showStatus(ctx);
 	};
-	pi.on("session_start", onRestore);
+	pi.on("session_start", (event, ctx) => {
+		onRestore(event, ctx);
+		showIssues(ctx);
+	});
 	pi.on("session_tree", onRestore);
 
 	pi.on("session_shutdown", (_event, ctx) => {
@@ -204,13 +304,26 @@ ${conversation}
 		if (event.source === "extension" || event.streamingBehavior) return { action: "continue" };
 		const text = event.text.trim();
 		if (!text || text.startsWith("/")) return { action: "continue" };
+		failovers = 0;
 
-		const recent = recentUserTurns(ctx, RECENT_TURNS);
-		last = await classify(ctx, cfg, text, recent);
-		if (last.top && !cfg.intents[last.top]) last = { ...last, source: "none", error: `unknown intent ${last.top}` };
+		const explicit = checkExplicitSwitch(text, cfg.roles);
+		if (explicit) {
+			last = {
+				top: explicit,
+				confidence: 1.0,
+				margin: 1.0,
+				probs: { [explicit]: 1.0 },
+				source: "laya",
+				ms: 0,
+			};
+		} else {
+			const recent = recentUserTurns(ctx, RECENT_TURNS);
+			last = await classify(ctx, cfg, text, recent);
+			if (last.top && !cfg.roles[last.top]?.enabled) last = { ...last, source: "none", error: `unknown role ${last.top}` };
+		}
 
 		const prev = state.intent;
-		const result = decide(state, last, cfg.thresholds, cfg.defaultIntent);
+		const result = decide(state, last, cfg.thresholds, cfg.defaultRole);
 		state = result.state;
 		persist(pi, state);
 
@@ -250,24 +363,41 @@ ${conversation}
 	});
 
 	pi.on("before_agent_start", (event, ctx) => {
+		knownSkills = (event.systemPromptOptions.skills ?? []).map((s) => s.name);
 		const notice = pendingNotice ? noticeText(pendingNotice) : null;
 		pendingNotice = null; // never let a stale notice surface on a later turn
 		if (!isRouting(ctx)) return;
-		const intentName = state.intent ?? cfg.defaultIntent;
-		const intent = intentOf(intentName);
-		const skill = intent.skill ? ` If a \`${intent.skill}\` skill is available, load it with /skill:${intent.skill}.` : "";
-		const section = `\n\n## Router mode\nThis conversation is classified as **${intentName}**. ${intent.hint}${skill}`;
-
-		return {
-			systemPrompt: `${event.systemPrompt}${section}`,
-			...(notice ? { message: { customType: "laya-router", content: notice, display: true } } : {}),
-		};
+		const role = currentRole();
+		const skills = availableSkills(role);
+		const skillLine = skills.length
+			? ` Before starting, load ${skills.length === 1 ? "the skill" : "these skills"}: ${skills.map((s) => `/skill:${s}`).join(", ")}.`
+			: "";
+		event.systemPromptOptions.sections.laya_router = `This conversation is routed to the **${role.name}** role (${role.id}). ${role.hint}${skillLine}`;
+		if (notice) return { message: { customType: "laya-router", content: notice, display: true } };
 	});
 
 	// ---------------------------------------------------------------- command
 
+	function rolesReport(ctx: ExtensionContext): string {
+		const lines = Object.values(cfg.roles).map((role) => {
+			const active = role.id === currentRole().id ? "▶ " : "  ";
+			const models = role.models
+				.map((m) => {
+					const known = ctx.modelRegistry.find(cfg.provider.name, m) ? "" : "?";
+					const at = failed.get(m);
+					const down = at !== undefined && Date.now() - at < cfg.chain.retryAfterMs ? "✗" : "";
+					return `${m}${known}${down}`;
+				})
+				.join(" → ");
+			const skills = role.skills.map((s) => (knownSkills.length && !knownSkills.includes(s) ? `${s}?` : s)).join(", ");
+			const off = role.enabled ? "" : " (disabled)";
+			return `${active}${role.id}${off} — ${role.name}: ${role.description}\n    models: ${models}${skills ? `\n    skills: ${skills}` : ""}`;
+		});
+		return `${lines.join("\n")}\n(? = unknown to Pi, ✗ = failed recently)`;
+	}
+
 	pi.registerCommand("router", {
-		description: "Laya router: status | on | off | force <intent> | clear | intents | config",
+		description: "Laya router: status | on | off | force <role> | clear | roles | config | reload",
 		handler: async (args, ctx) => {
 			const [sub, arg] = args.trim().split(/\s+/);
 			const notify = (msg: string, kind: "info" | "warning" | "error" = "info") => ctx.ui.notify(msg, kind);
@@ -294,8 +424,8 @@ ${conversation}
 					notify(`router off: requests go to ${targetModel()} unchanged`);
 					return;
 				case "force": {
-					if (!arg || !cfg.intents[arg]) {
-						notify(`usage: /router force <${Object.keys(cfg.intents).join("|")}>`, "warning");
+					if (!arg || !cfg.roles[arg]?.enabled) {
+						notify(`usage: /router force <${roleIds().join("|")}>`, "warning");
 						return;
 					}
 					const from = state.intent;
@@ -316,18 +446,37 @@ ${conversation}
 					showStatus(ctx);
 					notify("router unpinned");
 					return;
+				case "roles":
 				case "intents":
+					notify(rolesReport(ctx));
+					return;
+				case "config": {
+					const loaded = new Set(cfg.sources);
+					const files = configLayers()
+						.map((f) => `  ${loaded.has(f) ? "✓" : "·"} ${f}`)
+						.join("\n");
+					const issues = cfg.issues.length ? `\nissues:\n${cfg.issues.map((i) => `  ${formatIssue(i)}`).join("\n")}` : "\nno issues";
 					notify(
-						Object.entries(cfg.intents)
-							.map(([k, v]) => `${k} → ${v.model}${v.skill ? ` (skill ${v.skill})` : ""}`)
-							.join("\n"),
+						`config layers (✓ loaded):\n${files}\nlaya ${cfg.laya.url} (${cfg.laya.model}) · fallback ${cfg.fallback.enabled ? cfg.fallback.model : "off"} · default role ${cfg.defaultRole} · log ${cfg.logPath}${issues}`,
+						cfg.issues.some((i) => i.level === "error") ? "warning" : "info",
 					);
 					return;
-				case "config":
-					notify(`config ${configPath()} · laya ${cfg.laya.url} (${cfg.laya.model}) · fallback ${cfg.fallback.enabled ? cfg.fallback.model : "off"} · log ${cfg.logPath}`);
+				}
+				case "reload": {
+					cfg = loadConfig();
+					failed.clear();
+					issuesShown = false;
+					showIssues(ctx);
+					if (state.forced && !cfg.roles[state.forced]?.enabled) {
+						state.forced = null;
+						persist(pi, state);
+					}
+					showStatus(ctx);
+					notify(`router config reloaded: ${roleIds().length} role(s) from ${cfg.sources.length} file(s)${cfg.issues.length ? `, ${cfg.issues.length} issue(s)` : ""}`);
 					return;
+				}
 				default:
-					notify("usage: /router [status|on|off|force <intent>|clear|intents|config]", "warning");
+					notify("usage: /router [status|on|off|force <role>|clear|roles|config|reload]", "warning");
 			}
 		},
 	});
