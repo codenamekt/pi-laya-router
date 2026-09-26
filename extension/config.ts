@@ -193,9 +193,18 @@ function finish(acc: Raw, issues: Issue[], sources: string[]): RouterConfig {
 	const fallback = pick("fallback", acc.sections.fallback, DEFAULTS.fallback, issues, { timeoutMs: { min: 1, integer: true }, assumedConfidence: unit });
 	const autoModel = pick("autoModel", acc.sections.autoModel, DEFAULTS.autoModel, issues, { contextWindow: { min: 1, integer: true }, maxTokens: { min: 1, integer: true } });
 	const chain = pick("chain", acc.sections.chain, DEFAULTS.chain, issues, { retryAfterMs: { min: 0, integer: true } });
-	const headroom = pick("headroom", acc.sections.headroom, DEFAULTS.headroom, issues);
-	const rawProvider = pick("provider", acc.sections.provider, DEFAULTS.provider, issues);
-	const provider = normalizeProvider(rawProvider, issues);
+	// Legacy `headroom: { provider, baseUrl }` maps onto `provider: { name, baseUrl }`; an explicit provider block wins.
+	let rawProvider: Record<string, unknown> = acc.sections.provider;
+	const legacy = acc.sections.headroom;
+	if (Object.keys(legacy).length > 0) {
+		issues.push({ level: "warning", path: "headroom", message: "deprecated; rename to `provider` with `name` and `baseUrl`" });
+		rawProvider = {
+			...(typeof legacy.provider === "string" ? { name: legacy.provider } : {}),
+			...(typeof legacy.baseUrl === "string" ? { baseUrl: legacy.baseUrl } : {}),
+			...rawProvider,
+		};
+	}
+	const provider = normalizeProvider(pick("provider", rawProvider, DEFAULTS.provider, issues), issues);
 
 	let roles = acc.roles ? normalizeRoles(acc.roles, issues) : { ...DEFAULTS.roles };
 	if (Object.keys(enabledRoles(roles)).length === 0) {

@@ -176,3 +176,13 @@ test("loadConfig reads the user file, its drop-in dir, and the project layer in 
 		else process.env.LAYA_ROUTER_CONFIG = prev;
 	}
 });
+
+test("a legacy headroom section maps onto provider with a deprecation warning", () => {
+	const cfg = buildConfig([{ file: "old.json", data: { headroom: { provider: "headroom", baseUrl: "http://nuc:8787/v1" } } }]);
+	assert.deepEqual(cfg.provider, { name: "headroom", baseUrl: "http://nuc:8787/v1" });
+	assert.ok(cfg.issues.some((i) => i.path === "headroom" && i.level === "warning"));
+	assert.deepEqual(errors(cfg), []);
+	const both = buildConfig([{ file: "x.json", data: { headroom: { provider: "old" }, provider: { name: "new" } } }]);
+	assert.equal(both.provider.name, "new");
+});
+
